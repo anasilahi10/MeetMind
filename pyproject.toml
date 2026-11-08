@@ -1,50 +1,19 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-.Python
 
-# Virtual environments
-.venv/
-venv/
-env/
+[project]
+name = "meetmind"
+version = "1.0.0"
+requires-python = ">=3.13"
+dependencies = [
+    "langchain>=1.4.9",
+    "langchain-ollama>=1.1.0",
+    "pandas>=3.1.1",
+    "pydantic>=2.14.3",
+    "python-dotenv>=1.2.4",
+    "sqlalchemy>=2.1.8",
+    "streamlit>=1.67.0",
+]
 
-# Secrets and local configuration
-.env
-.env.*
-!.env.example
-.streamlit/secrets.toml
-
-# Local databases
-data/*.db
-data/*.sqlite*
-data/*.sqlite3
-
-# Generated outputs
-outputs/*
-!outputs/.gitkeep
-
-# Backup files
-*.bak
-*.backup
-*.backup.*
-README_UPDATE.txt
-
-# macOS and editors
-.DS_Store
-.vscode/
-.idea/
-
-# Test and tooling caches
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# Logs
-*.log
-
-# Whisper.cpp - install separately
-whisper.cpp/
+[dependency-groups]
+dev = [
+    "cmake>=4.4.4",
+]
