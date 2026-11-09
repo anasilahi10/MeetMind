@@ -87,7 +87,6 @@ def transcribe_audio(audio_file):
             str(WHISPER_BINARY),
             "-m", str(WHISPER_MODEL),
             "-f", str(audio_path),
-            "-nt",
             "-l", "en",
             "-t", "2"
         ]

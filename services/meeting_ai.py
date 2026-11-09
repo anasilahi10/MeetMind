@@ -24,7 +24,8 @@ MAX_QUESTION_CHARS = 2000
 MAX_HISTORY_MESSAGES = 8
 
 DEFAULT_MODEL = "gemma:2b"
-OLLAMA_MODEL = os.getenv("MEETMIND_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+OLLAMA_MODEL = os.getenv(
+    "MEETMIND_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
 OLLAMA_CHAT_MODEL = (
     os.getenv("MEETMIND_CHAT_MODEL", OLLAMA_MODEL).strip() or OLLAMA_MODEL
 )
@@ -37,6 +38,9 @@ analysis_llm = ChatOllama(
 chat_llm = ChatOllama(
     model=OLLAMA_CHAT_MODEL,
     temperature=0,
+    reasoning=False,
+    num_ctx=2048,
+    num_predict=256,
 )
 
 
@@ -80,10 +84,12 @@ def parse_json(content: str) -> dict:
         try:
             parsed, _ = json.JSONDecoder().raw_decode(content[start:])
         except json.JSONDecodeError as exc:
-            raise ValueError("The local AI returned incomplete or invalid JSON.") from exc
+            raise ValueError(
+                "The local AI returned incomplete or invalid JSON.") from exc
 
     if not isinstance(parsed, dict):
-        raise ValueError("The local AI returned JSON, but it was not an object.")
+        raise ValueError(
+            "The local AI returned JSON, but it was not an object.")
     return parsed
 
 
@@ -124,6 +130,7 @@ def _normalise_owner(owner: str) -> str:
     if owner.casefold() in {
         "unknown", "not specified", "none", "n/a", "i", "me", "myself",
         "the speaker", "speaker", "someone", "unspecified",
+        "the", "a", "an", "this", "that",
     }:
         return "Unknown"
     return owner
@@ -134,6 +141,57 @@ def _normalise_deadline(deadline: str) -> str:
     if deadline.casefold() in {"unknown", "none", "n/a", "not mentioned", "unspecified"}:
         return "Not specified"
     return deadline
+
+
+def _is_vague_action_task(task: str) -> bool:
+    """Reject action labels that contain no identifiable task object.
+
+    Examples: "Fix it", "Complete that", and "Review". This is a
+    conservative quality filter; it does not try to resolve pronouns.
+    """
+    words = re.findall(r"[a-z]+", _normalise(task))
+    if not words:
+        return True
+
+    non_content = {
+        "a", "an", "and", "the", "to", "for", "with", "you", "your",
+        "it", "this", "that", "them", "these", "those", "me", "us",
+        "i", "we", "by", "on", "up",
+        "fix", "complete", "finish", "review", "test", "prepare",
+        "publish", "send", "launch", "create", "resolve", "approve",
+        "submit", "deliver", "update", "follow", "check", "finalize",
+        "finalise", "implement", "build", "provide", "share", "confirm",
+        "schedule", "organize", "organise", "draft", "discuss",
+        "contact", "call", "pay", "monitor", "circulate",
+        "process", "correct",
+    }
+    return not any(word not in non_content for word in words)
+
+
+def _is_status_statement_task(task: str) -> bool:
+    """Reject status statements mistakenly formatted as action items."""
+    text = _normalise(task)
+    return bool(re.match(
+        r"^.+?\s+(?:is|are|was|were)\s+"
+        r"(?:\d+(?:\.\d+)?\s*%\s*)?(?:complete|completed|done|finished|pending)\b",
+        text,
+    ))
+
+
+def _normalise_date_text(value: str) -> str:
+    """Normalize common written date variants for evidence comparison."""
+    value = _normalise(value)
+    value = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", value)
+    value = re.sub(r"\bsept\b", "september", value)
+    month_aliases = {
+        "jan": "january", "feb": "february", "mar": "march",
+        "apr": "april", "jun": "june", "jul": "july",
+        "aug": "august", "sep": "september", "oct": "october",
+        "nov": "november", "dec": "december",
+    }
+    for short, full in month_aliases.items():
+        value = re.sub(rf"\b{short}\b", full, value)
+    return re.sub(r"[,\s]+", " ", value).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -213,15 +271,28 @@ _DATE_RE = re.compile(_DATE, re.IGNORECASE)
 
 
 def _sentences(transcript: str) -> list[str]:
-    """Split transcript into sentence-like units without changing their text."""
-    return [m.group(0).strip() for m in re.finditer(r"[^.!?]+(?:[.!?]+|$)", transcript) if m.group(0).strip()]
+    """Split transcript into sentence-like units, ignoring timestamp decimals."""
+    # Streamlit's editable transcript can include [HH:MM:SS.mmm --> ...] prefixes.
+    # Remove only those metadata prefixes for rule matching; evidence is still
+    # checked against the untouched original transcript.
+    without_timestamps = re.sub(
+        r"\[\d{2}:\d{2}:\d{2}\.\d+\s*-->\s*\d{2}:\d{2}:\d{2}\.\d+\]\s*",
+        "",
+        transcript,
+    )
+    return [
+        match.group(0).strip()
+        for match in re.finditer(r"[^.!?]+(?:[.!?]+|$)", without_timestamps)
+        if match.group(0).strip()
+    ]
 
 
 def _task_from_fragment(fragment: str, inherited_verb: str = "") -> str:
     task = re.sub(r"^[,;:\s]+|[,;:\s]+$", "", fragment).strip()
     task = re.sub(r"^(?:that\s+)?", "", task, flags=re.IGNORECASE)
-    task = re.sub(r"\s+(?:by|on)\s+" + _DATE + r"\s*$", "", task, flags=re.IGNORECASE).strip()
-    task = re.sub(r"\s+", " ", task).strip(" ,;:")
+    task = re.sub(r"\s+(?:by|on)\s+" + _DATE + r"\s*$",
+                  "", task, flags=re.IGNORECASE).strip()
+    task = re.sub(r"\s+", " ", task).strip(" ,;:.!?\t\n")
     if not task:
         return ""
 
@@ -244,24 +315,6 @@ def _task_from_fragment(fragment: str, inherited_verb: str = "") -> str:
             task = infinitive + task[len(gerund):]
             break
 
-    # In coordinated speech, speakers often omit the verb in later clauses:
-    # "finish the module by Monday and testing by Tuesday".
-    if inherited_verb and not re.match(
-        r"^(?:complete|finish|test|review|prepare|publish|send|launch|create|resolve|approve|submit|deliver|update|follow|check|finali[sz]e|implement|fix|build|provide|share|confirm|schedule|organize|organise|draft|discuss|contact|call|email|pay|review)\b",
-        task,
-        re.IGNORECASE,
-    ):
-        return f"{inherited_verb} {task}".strip()
-
-    # Noun/gerund fragments with a deadline are retained as clear, conservative
-    # task labels rather than silently discarded.
-    if re.match(r"^(?:testing|posts|professional posts|expenses|the email campaign|email campaign)\b", task, re.IGNORECASE):
-        if re.match(r"^testing\b", task, re.IGNORECASE):
-            return f"Complete {task}"
-        if re.match(r"^(?:posts|professional posts)\b", task, re.IGNORECASE):
-            return f"Prepare {task}"
-        if re.match(r"^expenses\b", task, re.IGNORECASE):
-            return f"Review {task}"
     return task[0].upper() + task[1:]
 
 
@@ -290,47 +343,91 @@ def _extract_explicit_action_candidates(transcript: str) -> list[dict]:
     for sentence in _sentences(transcript):
         # Explicit named assignment: "Raul, you are responsible for resolving ... by ..."
         assigned = re.search(
-            r"\b([A-Z][A-Za-z'-]+)\s*,\s*you are responsible for\s+(.+?)(?:\s+(?:by|on)\s+(" + _DATE + r"))(?=[,;.]|$)",
+            r"\b([A-Z][A-Za-z'-]+)\s*,\s*you are responsible for\s+(.+?)"
+            r"(?:\s+(?:by|on)\s+(" + _DATE + r"))?(?=[,;.]|$)",
             sentence,
             re.IGNORECASE,
         )
         if assigned:
-            add(_task_from_fragment(assigned.group(2)), assigned.group(1), assigned.group(3), assigned.group(0))
+            add(
+                _task_from_fragment(assigned.group(2)),
+                assigned.group(1),
+                assigned.group(3) or "Not specified",
+                assigned.group(0),
+            )
 
-        # Explicit named request: "Raul, please follow up by November 10th."
-        requested = re.search(
-            r"\b([A-Z][A-Za-z'-]+)\s*,\s*please\s+(.+?)(?:\s+(?:by|on)\s+(" + _DATE + r"))(?=[,;.]|$)",
+        # Explicit named requests. When a sentence contains multiple dated
+        # clauses, keep each task paired with its own deadline.
+        requested = re.match(
+            r"^\s*([A-Z][A-Za-z'-]+)(?:,\s*(?:please\s+)?|\s+please\s+)(.+)$",
             sentence,
-            re.IGNORECASE,
         )
         if requested:
-            add(_task_from_fragment(requested.group(2)), requested.group(1), requested.group(3), requested.group(0))
+            owner = requested.group(1)
+            request_body = requested.group(2).strip()
+            dated_clauses = re.split(
+                r"\s+and\s+(?=(?:follow up|resolve|finish|complete|test|review|prepare|"
+                r"publish|send|launch|create|approve|submit|deliver|update|fix|provide|"
+                r"share|confirm|schedule|organize|organise|draft|contact|call|email|pay|"
+                r"monitor|circulate|process|correct)\b)",
+                request_body,
+                flags=re.IGNORECASE,
+            )
+            clause_dates = [_DATE_RE.search(clause)
+                            for clause in dated_clauses]
+            # Split only when each coordinated clause has its own explicit date.
+            # Otherwise preserve the complete compound commitment as one task.
+            split_dated_tasks = (
+                len(dated_clauses) > 1
+                and all(match is not None for match in clause_dates)
+            )
+            clauses_to_add = dated_clauses if split_dated_tasks else [
+                request_body]
+            for clause in clauses_to_add:
+                date_match = _DATE_RE.search(clause)
+                deadline = date_match.group(
+                    0) if date_match else "Not specified"
+                task_fragment = clause
+                if date_match:
+                    task_fragment = clause[:date_match.start()].strip()
+                    task_fragment = re.sub(
+                        r"\s+(?:by|on)\s*$", "", task_fragment, flags=re.IGNORECASE
+                    ).strip()
+                task = _task_from_fragment(task_fragment)
+                if task:
+                    add(task, owner, deadline, sentence)
 
         # First-person commitments. The speaker's name is not guessed from
         # nearby dialogue; the UI can show Unknown until a person is confirmed.
-        first_person = re.search(r"\b(I['’]ll|I will|we['’]ll|we will)\s+(.+)$", sentence, re.IGNORECASE)
+        first_person = re.search(
+            r"\b(I['’]ll|I will|we['’]ll|we will)\s+(.+)$", sentence, re.IGNORECASE)
         if first_person:
             body = first_person.group(2).strip().rstrip(".!? ")
-            # Split coordinated actions so each deadline stays with its own task.
-            fragments = re.split(r"\s+and\s+", body, flags=re.IGNORECASE)
-            inherited_verb = ""
-            for fragment in fragments:
-                date_match = _DATE_RE.search(fragment)
-                deadline = date_match.group(0) if date_match else "Not specified"
-                clean_fragment = fragment[:date_match.start()].strip() if date_match else fragment.strip()
-                clean_fragment = re.sub(r"\s+(?:by|on)\s*$", "", clean_fragment, flags=re.IGNORECASE).strip()
-                verb_match = re.match(
-                    r"(finish|complete|test|review|prepare|publish|send|launch|create|resolve|approve|submit|deliver|update|follow up|check|finali[sz]e|implement|fix|build|provide|share|confirm|schedule|organize|organise|draft|discuss|contact|call|email|pay)\b",
-                    clean_fragment,
-                    re.IGNORECASE,
-                )
-                if verb_match:
-                    inherited_verb = verb_match.group(1).capitalize()
-                task = _task_from_fragment(clean_fragment, inherited_verb if not verb_match else "")
-                if task:
-                    add(task, "Unknown", deadline, fragment.strip())
 
-        # Do not infer an action from a deadline-bearing noun phrase alone. Only explicit commitments, assignments, or requests are recovered here.
+            # Preserve coordinated commitments as one complete action.
+            date_match = _DATE_RE.search(body)
+
+            deadline = date_match.group(0) if date_match else "Not specified"
+
+            clean_fragment = (
+                body[:date_match.start()].strip()
+                if date_match
+                else body.strip()
+            )
+
+            clean_fragment = re.sub(
+                r"\s+(?:by|on)\s*$",
+                "",
+                clean_fragment,
+                flags=re.IGNORECASE,
+            ).strip()
+
+            task = _task_from_fragment(clean_fragment)
+
+            if task and not _is_vague_action_task(task):
+                add(task, "Unknown", deadline, body.strip())
+
+    # Do not infer an action from a deadline-bearing noun phrase alone. Only explicit commitments, assignments, or requests are recovered here.
 
     # De-duplicate by task + deadline while preserving the first exact evidence.
     unique: list[dict] = []
@@ -344,44 +441,142 @@ def _extract_explicit_action_candidates(transcript: str) -> list[dict]:
 
 
 def _merge_action_items(transcript: str, model_items: Any) -> list[dict]:
-    """Merge model output with conservative rule-based coverage candidates."""
-    model_list = [x for x in _as_list(model_items) if isinstance(x, dict)]
-    candidates = _extract_explicit_action_candidates(transcript)
-    merged = list(model_list)
+    """Combine model results with explicit transcript candidates conservatively."""
+    from difflib import SequenceMatcher
 
-    def similarity(a: str, b: str) -> float:
-        from difflib import SequenceMatcher
+    def task_similarity(a: str, b: str) -> float:
         na, nb = _normalise(a), _normalise(b)
         if not na or not nb:
             return 0.0
-        if na in nb or nb in na:
+        if na == nb or na in nb or nb in na:
             return 1.0
         return SequenceMatcher(None, na, nb).ratio()
 
-    for candidate in candidates:
+    def merge_metadata(existing: dict, incoming: dict) -> dict:
+        merged_item = dict(existing)
+        for field in ("task", "responsible_person", "deadline", "priority", "evidence"):
+            old_value = _safe_string(merged_item.get(field))
+            new_value = _safe_string(incoming.get(field))
+            if not old_value or old_value.casefold() in {"unknown", "not specified"}:
+                if new_value:
+                    merged_item[field] = new_value
+        # Prefer the richer task label when one clearly contains the other.
+        old_task = _safe_string(existing.get("task"))
+        new_task = _safe_string(incoming.get("task"))
+        if len(new_task) > len(old_task) and task_similarity(old_task, new_task) >= 0.88:
+            merged_item["task"] = new_task
+        return merged_item
+
+    merged: list[dict] = []
+    for raw_item in _as_list(model_items):
+        if not isinstance(raw_item, dict):
+            continue
+        task = _safe_string(raw_item.get("task"))
+        evidence = _safe_string(raw_item.get("evidence"))
+        if not task or _is_vague_action_task(task) or _is_status_statement_task(task):
+            continue
+        if evidence and not _evidence_is_present(transcript, evidence):
+            continue
+
+        duplicate_index = None
+        for index, existing in enumerate(merged):
+            same_deadline = (
+                _normalise_deadline(_safe_string(
+                    existing.get("deadline"), "Not specified"))
+                == _normalise_deadline(_safe_string(raw_item.get("deadline"), "Not specified"))
+            )
+            if same_deadline and task_similarity(task, _safe_string(existing.get("task"))) >= 0.90:
+                duplicate_index = index
+                break
+        if duplicate_index is None:
+            # If the model split one quoted assignment into multiple verbs,
+            # consolidate only when evidence, owner, and deadline all match.
+            compound_index = None
+            for index, existing in enumerate(merged):
+                same_evidence = (
+                    _normalise(_safe_string(existing.get("evidence")))
+                    == _normalise(evidence)
+                    and bool(evidence)
+                )
+                same_owner = (
+                    _normalise_owner(_safe_string(
+                        existing.get("responsible_person"), "Unknown"))
+                    == _normalise_owner(_safe_string(raw_item.get("responsible_person"), "Unknown"))
+                )
+                same_deadline = (
+                    _normalise_date_text(_safe_string(
+                        existing.get("deadline"), "Not specified"))
+                    == _normalise_date_text(_safe_string(raw_item.get("deadline"), "Not specified"))
+                )
+                if same_evidence and same_owner and same_deadline:
+                    compound_index = index
+                    break
+            if compound_index is None:
+                merged.append(dict(raw_item))
+            else:
+                existing = dict(merged[compound_index])
+                old_task = _safe_string(existing.get("task"))
+                new_task = task
+                old_words = old_task.split()
+                new_words = new_task.split()
+                old_verb = old_words[0] if old_words else ""
+                new_verb = new_words[0] if new_words else ""
+                old_object = " ".join(old_words[1:]).casefold()
+                new_object = " ".join(new_words[1:]).casefold()
+                if old_verb.casefold() != new_verb.casefold() and old_object == new_object and old_object:
+                    existing["task"] = f"{old_verb} and {new_verb.lower()} {' '.join(old_words[1:])}"
+                elif len(new_task) > len(old_task):
+                    existing["task"] = new_task
+                merged[compound_index] = existing
+        else:
+            merged[duplicate_index] = merge_metadata(
+                merged[duplicate_index], raw_item)
+
+    for candidate in _extract_explicit_action_candidates(transcript):
+        if _is_vague_action_task(candidate["task"]):
+            continue
         match_index = None
-        for i, existing in enumerate(merged):
-            if similarity(candidate["task"], _safe_string(existing.get("task"))) >= 0.72:
-                match_index = i
+        for index, existing in enumerate(merged):
+            existing_task = _safe_string(existing.get("task"))
+            candidate_deadline = _normalise_deadline(candidate["deadline"])
+            existing_deadline = _normalise_deadline(
+                _safe_string(existing.get("deadline"), "Not specified")
+            )
+            deadline_compatible = (
+                candidate_deadline == "not specified"
+                or existing_deadline == "not specified"
+                or _normalise_date_text(candidate_deadline) == _normalise_date_text(existing_deadline)
+            )
+            candidate_evidence = _normalise(candidate["evidence"])
+            existing_evidence = _normalise(
+                _safe_string(existing.get("evidence")))
+            evidence_related = bool(
+                candidate_evidence and existing_evidence
+                and (candidate_evidence in existing_evidence or existing_evidence in candidate_evidence)
+            )
+            if deadline_compatible and (
+                task_similarity(candidate["task"], existing_task) >= 0.84
+                or evidence_related
+            ):
+                match_index = index
                 break
         if match_index is None:
             merged.append(candidate)
             continue
 
-        # The deterministic clause-level date takes precedence over a model
-        # date that may have leaked from an adjacent task. Owner stays Unknown
-        # unless the source sentence explicitly names one.
         existing = dict(merged[match_index])
-        existing["deadline"] = candidate["deadline"]
         if candidate["responsible_person"] != "Unknown":
             existing["responsible_person"] = candidate["responsible_person"]
-        else:
-            existing["responsible_person"] = "Unknown"
-        # Keep the task label no more specific than the exact clause-level
-        # evidence supports (e.g. "Follow up", not an inferred object).
-        existing["task"] = candidate["task"]
-        existing["evidence"] = candidate["evidence"]
-        existing["priority"] = candidate["priority"]
+        if candidate["deadline"] != "Not specified":
+            existing["deadline"] = candidate["deadline"]
+        # Candidate evidence is an exact transcript quote and supports its
+        # deterministic owner/deadline fields. Preserve model evidence otherwise.
+        if (candidate["responsible_person"] != "Unknown"
+                or candidate["deadline"] != "Not specified"):
+            existing["evidence"] = candidate["evidence"]
+        if len(candidate["task"]) > len(_safe_string(existing.get("task"))):
+            existing["task"] = candidate["task"]
+        existing["priority"] = _safe_string(existing.get("priority"), "Medium")
         merged[match_index] = existing
 
     return merged
@@ -429,8 +624,10 @@ def _validate_analysis(transcript: str, result: dict) -> dict:
             "evidence_verified": verified,
         })
         if not verified:
-            warnings.append(f"Fact {index} has missing or non-matching transcript evidence.")
-            blocking_issues.append(f"Fact {index} could not be verified against the transcript.")
+            warnings.append(
+                f"Fact {index} has missing or non-matching transcript evidence.")
+            blocking_issues.append(
+                f"Fact {index} could not be verified against the transcript.")
 
     # Action items are eligible for storage only when their evidence is present
     # in the transcript. Missing owner/deadline is incomplete, not fabricated.
@@ -449,22 +646,29 @@ def _validate_analysis(transcript: str, result: dict) -> dict:
                 f"Action item {index} ({task}) was excluded because its evidence "
                 "is missing or does not match the transcript."
             )
-            blocking_issues.append(f"Action item {index} could not be verified.")
+            blocking_issues.append(
+                f"Action item {index} could not be verified.")
             continue
 
-        owner = _normalise_owner(_safe_string(item.get("responsible_person"), "Unknown"))
-        deadline = _normalise_deadline(_safe_string(item.get("deadline"), "Not specified"))
+        owner = _normalise_owner(_safe_string(
+            item.get("responsible_person"), "Unknown"))
+        deadline = _normalise_deadline(_safe_string(
+            item.get("deadline"), "Not specified"))
         priority = _safe_string(item.get("priority"), "Medium").title()
         if priority not in {"High", "Medium", "Low"}:
             priority = "Medium"
 
         evidence_norm = _normalise(evidence)
-        owner_verified = owner != "Unknown" and _normalise(owner) in evidence_norm
+        owner_verified = owner != "Unknown" and _normalise(
+            owner) in evidence_norm
         if not owner_verified:
             owner = "Unknown"
             warnings.append(f"Action item has no confirmed owner: {task}")
 
-        deadline_verified = deadline != "Not specified" and _normalise(deadline) in evidence_norm
+        deadline_verified = (
+            deadline != "Not specified"
+            and _normalise_date_text(deadline) in _normalise_date_text(evidence_norm)
+        )
         if not deadline_verified:
             deadline = "Not specified"
             warnings.append(f"Action item has no confirmed deadline: {task}")
@@ -481,7 +685,14 @@ def _validate_analysis(transcript: str, result: dict) -> dict:
         })
 
     next_meeting = _safe_string(result.get("next_meeting"), "Not specified")
-    if next_meeting.casefold() in {"unknown", "none", "n/a", "not mentioned"}:
+    if (
+        next_meeting.casefold() in {"unknown", "none", "n/a", "not mentioned"}
+        or (next_meeting.casefold() != "not specified"
+            and _normalise_date_text(next_meeting) not in _normalise_date_text(transcript))
+    ):
+        if next_meeting.casefold() != "not specified":
+            warnings.append(
+                "Next-meeting date could not be matched to the transcript.")
         next_meeting = "Not specified"
 
     result["summary"] = summary
@@ -540,40 +751,54 @@ def analyze_meeting(transcript: str) -> dict:
 
 
 def chat_with_meeting(transcript: str, question: str, history: list | None = None) -> str:
-    """Answer a question using only the supplied meeting transcript."""
+    """Answer questions using only the supplied meeting transcript."""
+
     if not isinstance(transcript, str) or not transcript.strip():
         raise ValueError("Meeting transcript is unavailable.")
+
     if len(transcript) > MAX_CHAT_TRANSCRIPT_CHARS:
         raise ValueError(
-            f"Transcript exceeds the chat limit of {MAX_CHAT_TRANSCRIPT_CHARS:,} "
-            "characters. It was not truncated."
+            f"Transcript exceeds the chat limit of "
+            f"{MAX_CHAT_TRANSCRIPT_CHARS:,} characters. It was not truncated."
         )
+
     if not isinstance(question, str) or not question.strip():
         raise ValueError("Please enter a question.")
+
     if len(question) > MAX_QUESTION_CHARS:
-        raise ValueError(f"Please keep your question under {MAX_QUESTION_CHARS:,} characters.")
+        raise ValueError(
+            f"Please keep your question under {MAX_QUESTION_CHARS:,} characters."
+        )
 
     safe_history = []
     for item in (history or [])[-MAX_HISTORY_MESSAGES:]:
         if not isinstance(item, dict):
             continue
+
         role = item.get("role")
         content = item.get("content")
+
         if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
-            safe_history.append(f"{role}: {content[:1500]}")
+            safe_history.append(f"{role}: {content[:1000]}")
 
     conversation = "\n".join(safe_history) or "No previous conversation."
-    prompt = f"""You are MeetMind, a professional meeting assistant.
-Answer using ONLY the meeting transcript. The conversation history is included
-only to understand follow-up questions; it is not a source of meeting facts.
+
+    prompt = f"""You are MeetMind, an accurate meeting assistant.
+
+Answer the user's question using ONLY the meeting transcript.
 
 Rules:
-- Be precise with names, dates, times, numbers, currencies, owners and status.
-- Do not invent missing information or infer a person's identity from "I".
+- Identify ALL relevant tasks, responsibilities and follow-ups.
+- Include names, deadlines, dates, numbers and status accurately.
 - Distinguish completed work from pending work.
-- If the transcript does not contain the answer, say that it was not specified.
-- If two statements conflict, explain the conflict instead of choosing silently.
-- Answer naturally and concisely. Do not return JSON.
+- Include external dependencies and provider follow-ups.
+- Never invent missing information.
+- If information is unavailable, explicitly say it was not specified.
+- Use conversation history only to understand follow-up questions.
+- Do not treat conversation history as a source of facts.
+- Be direct and concise. Do not show internal reasoning.
+- Use numbered points when listing multiple tasks.
+- Do not omit relevant tasks simply to make the answer shorter.
 
 Conversation history:
 {conversation}
@@ -586,18 +811,20 @@ Meeting transcript:
 User question:
 {question}
 
-Answer:
+Provide the final answer:
 """
 
     try:
         response = chat_llm.invoke(prompt)
     except Exception as error:
         raise RuntimeError(
-            f"Local meeting chat failed. Check Ollama and '{OLLAMA_CHAT_MODEL}'. "
-            f"Details: {error}"
+            f"Local meeting chat failed. Check Ollama and "
+            f"'{OLLAMA_CHAT_MODEL}'. Details: {error}"
         ) from error
 
     answer = _response_text(response)
+
     if not answer:
         raise ValueError("The AI returned an empty answer.")
+
     return answer
