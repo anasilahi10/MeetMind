@@ -14,7 +14,7 @@ import re
 from typing import Any
 
 from dotenv import load_dotenv
-from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 
 load_dotenv()
 
@@ -23,25 +23,43 @@ MAX_CHAT_TRANSCRIPT_CHARS = 18000
 MAX_QUESTION_CHARS = 2000
 MAX_HISTORY_MESSAGES = 8
 
-DEFAULT_MODEL = "gemma:2b"
-OLLAMA_MODEL = os.getenv(
-    "MEETMIND_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
-OLLAMA_CHAT_MODEL = (
-    os.getenv("MEETMIND_CHAT_MODEL", OLLAMA_MODEL).strip() or OLLAMA_MODEL
+DEFAULT_MODEL = "openrouter/free"
+
+MEETMIND_MODEL = (
+    os.getenv("MEETMIND_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
 )
 
-analysis_llm = ChatOllama(
-    model=OLLAMA_MODEL,
-    temperature=0,
-    format="json",
+MEETMIND_CHAT_MODEL = (
+    os.getenv("MEETMIND_CHAT_MODEL", MEETMIND_MODEL).strip()
+    or MEETMIND_MODEL
 )
-chat_llm = ChatOllama(
-    model=OLLAMA_CHAT_MODEL,
-    temperature=0,
-    reasoning=False,
-    num_ctx=2048,
-    num_predict=256,
-)
+
+
+def get_openrouter_llm(model_name: str) -> ChatOpenAI:
+    """Create an OpenRouter chat model when a request is made."""
+
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+
+    if not api_key:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is missing. Add it to your .env file."
+        )
+
+    return ChatOpenAI(
+        model=model_name,
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+        timeout=120,
+        max_retries=2,
+    )
+
+
+def get_analysis_llm() -> ChatOpenAI:
+    return get_openrouter_llm(MEETMIND_MODEL)
+
+
+def get_chat_llm() -> ChatOpenAI:
+    return get_openrouter_llm(MEETMIND_CHAT_MODEL)
 
 
 # ---------------------------------------------------------------------------
@@ -733,7 +751,7 @@ def analyze_meeting(transcript: str) -> dict:
         )
 
     try:
-        response = analysis_llm.invoke(_build_prompt(transcript))
+        response = get_analysis_llm().invoke(_build_prompt(transcript))
         result = parse_json(_response_text(response))
         # A second, deterministic pass recovers explicit commitments that the
         # local model may omit and prevents adjacent deadlines being borrowed.
@@ -745,8 +763,8 @@ def analyze_meeting(transcript: str) -> dict:
         raise
     except Exception as error:
         raise RuntimeError(
-            "Meeting analysis failed. Confirm Ollama is running and that "
-            f"'{OLLAMA_MODEL}' is installed. Details: {error}"
+            f"OpenRouter meeting analysis failed. "
+            f"Check your API key and model '{MEETMIND_MODEL}'. Details: {error}"
         ) from error
 
 
@@ -815,11 +833,11 @@ Provide the final answer:
 """
 
     try:
-        response = chat_llm.invoke(prompt)
+        response = get_chat_llm().invoke(prompt)
     except Exception as error:
         raise RuntimeError(
-            f"Local meeting chat failed. Check Ollama and "
-            f"'{OLLAMA_CHAT_MODEL}'. Details: {error}"
+            f"OpenRouter meeting chat failed. "
+            f"Check your API key and model '{MEETMIND_CHAT_MODEL}'. Details: {error}"
         ) from error
 
     answer = _response_text(response)
