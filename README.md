@@ -1,260 +1,83 @@
-# MeetMind — AI-Powered Meeting Intelligence
+# 🧠 MeetMind: Local AI Meeting Intelligence
 
-MeetMind is an AI-powered meeting assistant built with Python and Streamlit. It converts meeting recordings into structured meeting intelligence, including summaries, decisions, risks, deadlines, and action items.
-
-MeetMind uses **whisper.cpp** for local audio transcription and **OpenRouter** for cloud-based AI analysis and meeting chat. It validates extracted information against transcript evidence and allows users to review results before saving them.
+Turn meeting recordings into **speaker-labeled transcripts, summaries and action items**, using free tools and a model-agnostic LLM layer. Audio is transcribed on your own machine.
 
 ## Features
 
-- Local audio transcription using `whisper.cpp`
-- Editable transcript review before AI analysis
-- AI-generated executive summaries
-- Automatic extraction of meeting objectives and discussion points
-- Decision, risk, and unresolved-question identification
-- Action-item extraction with responsible persons and deadlines
-- Transcript evidence validation for extracted facts and action items
-- Human review before saving meeting analysis
-- SQLite database for meetings, tasks, and chat history
-- Chat with saved meeting transcripts
-- Meeting history, search, and report/transcript downloads
-- Task status management and analytics
+- **Transcription** with faster-whisper (local, CPU), with vocabulary hints for names and jargon
+- **Speaker detection** with pyannote 3.1, assigned **word by word** so short interruptions are caught
+- **Structured output:** summary, key decisions, open questions, and an action-items table (CSV / Word export)
+- **Ask AI** about one meeting, or **across all saved meetings**
+- **Saved meetings** in SQLite, with speaker renaming and transcript search
+- **Upload or record** from the browser microphone
+- **Switchable LLM:** OpenRouter, Groq, local Ollama, or any OpenAI-compatible API, with a *Test connection* button
 
-## Architecture
+## How it works
 
-```text
-Audio Recording
-      |
-      v
-whisper.cpp
-(Local Speech-to-Text)
-      |
-      v
-Editable Transcript
-(Streamlit)
-      |
-      v
-OpenRouter API
-(LangChain + ChatOpenAI)
-      |
-      v
-Structured AI Analysis
-(JSON Output)
-      |
-      v
-Python Validation
-(Evidence + Action Items)
-      |
-      v
-Human Review
-      |
-      v
-SQLite Database
-      |
-      +----> Meeting History
-      +----> Meeting Chat
-      +----> Task Manager
-      +----> Analytics
+```
+recording → ffmpeg (16 kHz mono, cleanup)
+          → faster-whisper  → words + timestamps
+          → pyannote        → who spoke when
+          → merge           → "[00:15] SPEAKER_01: ..." transcript
+          → LLM (your choice) → summary, decisions, action items, Q&A
+          → SQLite + Streamlit UI
 ```
 
-## Technology Stack
+## Quick start
 
-| Component | Technology |
-|---|---|
-| Programming language | Python 3.13 |
-| Frontend | Streamlit |
-| AI model provider | OpenRouter |
-| AI integration | LangChain |
-| Model interface | langchain-openai |
-| Speech-to-text | whisper.cpp |
-| Database | SQLite |
-| Database toolkit | SQLAlchemy |
-| Data processing | Pandas |
-| Validation | Python |
-
-## Requirements
-
-- Python 3.13
-- Git
-- `uv` package manager
-- CMake
-- OpenRouter API key
-- `whisper.cpp` built locally
-- Compatible Whisper GGML model
-
-## Installation
-
-### 1. Clone the repository
+Requires **Python 3.11** (3.13 is not supported by the dependencies), **ffmpeg**, and a free Hugging Face account.
 
 ```bash
 git clone https://github.com/anasilahi10/MeetMind.git
 cd MeetMind
+conda create -n meetmind python=3.11 -y && conda activate meetmind
+conda install -c conda-forge ffmpeg -y
+pip install -r requirements.txt        # or: uv pip install -r requirements.txt
 ```
 
-### 2. Install dependencies
+1. On Hugging Face, accept the terms for `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0`, then create a **Read** token.
+2. Copy `.env.example` to `.env` and fill in your keys (OpenRouter key and the Hugging Face token).
+3. Run `streamlit run app.py`.
+
+No recording handy? On macOS, `python make_demo.py` generates a 3-speaker demo meeting (`demo_meeting.wav`) with built-in voices.
+
+## Choosing a model
+
+Open **AI model** in the sidebar: pick a provider and model (or enter a custom model ID), paste an API key if you do not use `.env`, and click **Test connection**. Free models work; stronger models give better summaries.
+
+## Tests
 
 ```bash
-uv sync
+pip install pytest
+python -m pytest -q
 ```
 
-### 3. Configure environment variables
+## Design decisions
 
-Create your local environment file:
+- **Word-level speaker assignment:** each word gets the speaker active at its timestamp, and one- or two-word flips are smoothed. This catches interruptions that sentence-level assignment hides.
+- **Map-reduce summarization:** long transcripts are chunked, summarized per chunk, then combined, so free models with small limits still work.
+- **Honest output:** low-confidence passages are marked `[unclear]`, and prompts tell the model not to invent facts or treat suggestions as tasks.
+- **Privacy:** audio never leaves your machine. Only transcript text is sent to the LLM provider you choose (nothing leaves if you use local Ollama).
+- **Provider abstraction:** one OpenAI-compatible client works with OpenRouter, Groq, Ollama and custom endpoints.
 
-```bash
-cp .env.example .env
-```
+## Results and limitations
 
-Open `.env` and configure:
+Tested informally, on small samples:
 
-```dotenv
-OPENROUTER_API_KEY=your_openrouter_api_key
-MEETMIND_MODEL=openrouter/free
-MEETMIND_CHAT_MODEL=openrouter/free
-```
+- A synthetic 3-speaker demo meeting: all scripted action items (owner, task, deadline) were extracted correctly.
+- A real 3-minute product-team meeting clip recorded through speakers: transcript mostly accurate with the `small` model plus vocabulary hints, and a short interruption was correctly attributed to a second speaker.
 
-Replace the placeholder with your actual OpenRouter API key.
+Known limitations:
 
-Never commit your `.env` file or expose your API key.
+- **Speed:** CPU-only processing is slow. A short clip can take several minutes.
+- **Accuracy:** no formal WER/DER evaluation yet. Overlapping speech, noise and similar voices reduce speaker accuracy, and words at the edge of speech can be clipped.
+- **Free LLMs** can make small mistakes (for example, assigning a task to the wrong person), so check the transcript.
+- Speaker labels are generic (`SPEAKER_00`) until you rename them.
+- Dependency pins (`numpy<2`, `pyarrow<20`, `huggingface_hub<0.28`) exist for compatibility with pyannote 3.3 and PyTorch on macOS.
 
-### 4. Configure Whisper
+## Roadmap
 
-Build `whisper.cpp` and download a compatible GGML model.
-
-MeetMind currently expects:
-
-```text
-whisper.cpp/
-├── build/
-│   └── bin/
-│       └── whisper-cli
-└── models/
-    └── ggml-base.en.bin
-```
-
-Refer to the official repository for build instructions:
-
-https://github.com/ggml-org/whisper.cpp
-
-### 5. Run MeetMind
-
-```bash
-uv run streamlit run app.py
-```
-
-Open the local Streamlit URL displayed in your terminal.
-
-## How to Use
-
-1. Open the **New Meeting** section.
-2. Enter a meeting title and upload an audio recording.
-3. Wait for Whisper to generate the transcript.
-4. Review and correct names, dates, numbers, and unclear phrases.
-5. Run AI analysis on the transcript.
-6. Review the executive summary, objectives, decisions, risks, and action items.
-7. Check supporting transcript evidence and validation warnings.
-8. Review and save the meeting.
-9. Access saved meetings, chat, tasks, and analytics.
-
-## Model Configuration
-
-MeetMind uses OpenRouter for AI analysis and meeting chat.
-
-The model is configurable through environment variables:
-
-```dotenv
-MEETMIND_MODEL=openrouter/free
-MEETMIND_CHAT_MODEL=openrouter/free
-```
-
-- `MEETMIND_MODEL` controls meeting analysis.
-- `MEETMIND_CHAT_MODEL` controls chat with saved meetings.
-- If the chat model is not specified, it defaults to the analysis model.
-
-The default model is `openrouter/free`. You can configure other models supported by your OpenRouter account.
-
-## Validation and Reliability
-
-MeetMind includes a Python-based validation layer to improve the reliability of AI-generated meeting intelligence.
-
-It checks:
-
-- Whether extracted evidence quotes appear in the transcript.
-- Whether action-item owners are explicitly supported by the evidence.
-- Whether deadlines are supported by the corresponding evidence.
-- Whether action items are duplicated or too vague.
-- Whether extracted facts have supporting transcript evidence.
-
-Unverified information is flagged for review rather than silently treated as confirmed.
-
-**Important:** Evidence matching checks whether a quotation exists in the transcript. It does not independently prove that the AI interpreted the quotation correctly.
-
-## Testing
-
-Run the project's unit tests:
-
-```bash
-uv run python -m unittest discover -s tests -v
-```
-
-Compile-check the application:
-
-```bash
-uv run python -m compileall -q app.py services utils tests
-```
-
-These checks do not replace end-to-end testing with actual audio recordings and OpenRouter requests.
-
-## Data and Privacy
-
-- Meeting records, transcripts, analysis, tasks, and chat history are stored in a local SQLite database.
-- Audio files are processed using local `whisper.cpp` and written to a temporary directory during transcription.
-- The AI analysis and meeting-chat features send transcript content to OpenRouter.
-- An internet connection and a valid OpenRouter API key are required for AI analysis and chat.
-- API data handling is subject to OpenRouter's applicable policies.
-- Never upload confidential meeting recordings without appropriate authorization.
-- Local environment files, databases, generated outputs, and virtual environments should not be committed to Git.
-
-## Known Limitations
-
-- Transcription is currently configured for English using the `base.en` Whisper model.
-- Speaker diarization is not implemented.
-- Owner attribution depends on explicit names or assignments in the transcript.
-- First-person statements such as "I will complete this" may have an unknown owner if the speaker's identity is not established.
-- Transcription errors can affect downstream AI analysis.
-- Evidence matching confirms quotation presence, not semantic correctness.
-- Human review is recommended before saving meeting analysis.
-- Long transcripts exceeding configured character limits are rejected rather than silently truncated.
-
-## Project Structure
-
-```text
-MeetMind/
-├── app.py
-├── services/
-│   ├── transcription.py
-│   ├── meeting_ai.py
-│   └── database.py
-├── utils/
-├── tests/
-├── data/                 # Local SQLite data
-├── outputs/              # Generated outputs
-├── whisper.cpp/          # Local transcription engine
-├── .env.example
-├── .gitignore
-├── README.md
-├── pyproject.toml
-├── requirements.txt
-└── uv.lock
-```
-
-## Future Improvements
-
-- Speaker diarization and improved speaker identification
-- Better action-item owner attribution
-- Improved transcription accuracy
-- Support for additional languages
-- More robust meeting analytics
-
----
-
-**MeetMind — Turning conversations into actionable meeting intelligence.**
+- Formal WER/DER evaluation on the AMI meeting corpus
+- Docker image
+- Background processing and a progress bar for long meetings
+- Speaker voice profiles, so known people are named automatically
