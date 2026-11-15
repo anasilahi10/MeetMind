@@ -10,3 +10,6 @@ __pycache__/
 *.mp4
 .streamlit/secrets.toml
 .DS_Store
+
+.vscode/
+.pytest_cache/
