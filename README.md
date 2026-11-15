@@ -1,5 +1,11 @@
 # 🧠 MeetMind: Local AI Meeting Intelligence
 
+![Overview: summary and action items](docs/overview.png)
+
+![Transcript with speaker labels](docs/transcript.png)
+
+![Ask across all meetings](docs/ask.png)
+
 Turn meeting recordings into **speaker-labeled transcripts, summaries and action items**, using free tools and a model-agnostic LLM layer. Audio is transcribed on your own machine.
 
 ## Features
