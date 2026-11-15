@@ -17,7 +17,7 @@ db.init_db()
 
 st.markdown("""
 <style>
-.block-container {padding-top: 2rem; max-width: 1200px;}
+.block-container {padding-top: 4.5rem; max-width: 1200px;}
 div[data-testid="stMetric"] {background: rgba(128,128,128,0.10); border-radius: 12px; padding: 12px 16px;}
 </style>
 """, unsafe_allow_html=True)
